@@ -1,0 +1,1212 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0,
+        maximum-scale=1.0, user-scalable=no">
+  <title>엘리멘탈 매치</title>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+  <style>
+    *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+    html, body { width:100%; height:100%; background:#2471A3; overflow:hidden;
+      display:flex; align-items:center; justify-content:center; }
+    canvas { display:block; touch-action:none; }
+  </style>
+</head>
+<body>
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  상수 & 설정
+// ═══════════════════════════════════════════════════════════════════
+
+const COLS = 9, ROWS = 9, CELL = 56;
+const DW   = 540, DH = 960;
+const BX   = (DW - COLS * CELL) / 2;   // 보드 좌측 X = 18
+const BY   = 160;                        // 보드 상단 Y
+const GW   = CELL - 6, GH = CELL - 6, GR = 10;
+
+// FSM 상태 열거
+const S = Object.freeze({
+  IDLE:'idle', SWAPPING:'swapping', REMOVING:'removing',
+  FALLING:'falling', REFILLING:'refilling', GAMEOVER:'gameover',
+});
+
+const MAX_LIVES    = 3;
+const SKULL_CHANCE_BASE = 0.10;  // 해골 스폰 기본 확률 (시작값)
+const SKULL_CHANCE_MAX  = 0.20;  // 해골 스폰 최대 확률
+const SKULL_CHANCE_STEP = 1000;  // 점수 N마다 확률 1% 증가
+const MAX_MANA     = 15;     // 마나바 표시 최댓값 (실제 마나는 99까지 누적 가능)
+
+// ── 젬 데이터 (0~4: 속성, 5: 해골) ─────────────────────────────
+// id 순서가 마나 배열 인덱스와 일치해야 함 (0=불, 1=물, 2=바람, 3=번개, 4=땅)
+const GEM_DATA = [
+  { id:0, name:'불',   color:0xE74C3C, hi:0xFF8A80, sh:0xA93226, symbol:'🔥', isSkull:false },
+  { id:1, name:'물',   color:0x2E86DE, hi:0x90CAF9, sh:0x1565C0, symbol:'💧', isSkull:false },
+  { id:2, name:'바람', color:0x27AE60, hi:0xA8E6CF, sh:0x1A7A40, symbol:'🌿', isSkull:false },
+  { id:3, name:'번개', color:0xF39C12, hi:0xFFE082, sh:0xB7770D, symbol:'⚡', isSkull:false },
+  { id:4, name:'땅',   color:0x9B59B6, hi:0xCE93D8, sh:0x6C3483, symbol:'🌑', isSkull:false },
+  { id:5, name:'해골', color:0x4A4A4A, hi:0xBBBBBB, sh:0x222222, symbol:'💀', isSkull:true  },
+];
+
+const NORMAL_GEM_COUNT = 5;   // 속성 젬 종류 수 (id 0~4)
+const BASE_SCORE       = 10;
+
+// ── 하단 패널 Y 좌표 ─────────────────────────────────────────────
+const MANA_Y      = BY + ROWS * CELL + 10;  // 674 : 마나 섹션 시작
+const SKILL_Y     = MANA_Y + 66;            // 740 : 스킬 버튼 시작
+const SKILL_BTN_H = 190;                    // 가로 배치 버튼 높이 (세로로 넉넉하게)
+const SKILL_GAP   = 7;                      // 버튼 간 간격
+
+const SKULL_COUNTER_INIT = 10;   // 해골 카운터 시작값
+
+// ── 스킬 데이터 ──────────────────────────────────────────────────
+// cost: [불(0), 물(1), 바람(2), 번개(3), 땅(4)] — GEM_DATA.id와 인덱스 일치
+const SKILL_DATA = [
+  {
+    id:0, name:'점수 쌓기', icon:'⭐',
+    desc:'점수 +300',
+    cost:[5, 0, 0, 5, 0],
+  },
+  {
+    id:1, name:'체력 회복', icon:'💊',
+    desc:'체력 1 회복',
+    cost:[0, 7, 7, 0, 7],
+  },
+  {
+    id:2, name:'해골 파괴', icon:'⚔️',
+    desc:'카운터 낮은 해골 7개 파괴',
+    cost:[10, 10, 0, 10, 10],
+  },
+];
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  메인 게임 씬
+// ═══════════════════════════════════════════════════════════════════
+class GameScene extends Phaser.Scene {
+
+  constructor() { super({ key:'GameScene' }); }
+  preload() {}
+
+  // ───────────────────────────────────────────────────────────────
+  //  create — 씬 시작·재시작 모두 여기서 상태를 초기화
+  // ───────────────────────────────────────────────────────────────
+  create() {
+    // 게임 상태 초기화 (scene.restart()로도 이 블록이 재실행됨)
+    this.board    = [];
+    this.pool     = [];
+    this.selected = null;
+    this._psx = 0; this._psy = 0;
+    this.state = S.IDLE;
+    this.score = 0; this.combo = 0;
+    this.lives = MAX_LIVES;
+
+    // localStorage에서 하이스코어 로드 (없으면 0)
+    this.hiScore = parseInt(localStorage.getItem('elemental_hiscore') || '0', 10);
+
+    // ★ 마나 배열 초기화 [불, 물, 바람, 번개, 땅] — GEM_DATA.id 순서
+    this.mana = [0, 0, 0, 0, 0];
+
+    this._buildBackground();
+    this._buildHeader();
+    this._buildBoardBg();
+    this._initBoard();
+    this._clearInitialMatches();
+    this._buildSkillPanel();   // 마나바 + 스킬 버튼 (하단 패널)
+    this._setupInput();
+  }
+
+  update() {}
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  씬 빌더 — 배경·헤더·보드
+  // ═══════════════════════════════════════════════════════════════
+
+  _buildBackground() {
+    // ── 하늘 그라데이션 (위: 밝은 하늘색 → 아래: 짙은 파랑) ─────
+    const sky = this.add.graphics();
+    // 위쪽 밝은 구역
+    sky.fillStyle(0x87CEEB, 1); sky.fillRect(0, 0, DW, DH * 0.45);
+    sky.fillStyle(0x5BAADC, 1); sky.fillRect(0, DH * 0.35, DW, DH * 0.25);
+    sky.fillStyle(0x2E86C1, 1); sky.fillRect(0, DH * 0.55, DW, DH * 0.45);
+
+    // ── 구름 (흰 타원 여러 개 겹치기) ────────────────────────────
+    const clouds = this.add.graphics();
+    clouds.fillStyle(0xFFFFFF, 0.85);
+    // 구름 1
+    clouds.fillEllipse( 90, 55, 100, 44);
+    clouds.fillEllipse(130, 48,  80, 38);
+    clouds.fillEllipse( 60, 60,  70, 32);
+    // 구름 2
+    clouds.fillEllipse(380, 38, 120, 48);
+    clouds.fillEllipse(430, 32,  90, 40);
+    clouds.fillEllipse(350, 44,  80, 34);
+    // 구름 3 (작은)
+    clouds.fillStyle(0xFFFFFF, 0.55);
+    clouds.fillEllipse(260, 70,  70, 28);
+    clouds.fillEllipse(290, 64,  55, 24);
+
+    // ── 아래 잔디 배경 (보드 아래) ──────────────────────────────
+    const grass = this.add.graphics();
+    // 밝은 풀밭
+    grass.fillStyle(0x4CAF50, 1);
+    grass.fillRect(0, BY + ROWS * CELL + 2, DW, DH - (BY + ROWS * CELL + 2));
+    // 잔디 어두운 띠
+    grass.fillStyle(0x388E3C, 1);
+    grass.fillRect(0, BY + ROWS * CELL + 2, DW, 12);
+
+    // ── 보드 좌우 잔디 기둥 느낌 ─────────────────────────────────
+    grass.fillStyle(0x388E3C, 0.35);
+    grass.fillRect(0, BY, BX, ROWS * CELL);
+    grass.fillRect(BX + COLS * CELL, BY, DW - (BX + COLS * CELL), ROWS * CELL);
+  }
+
+  _buildHeader() {
+    const H = BY - 2;
+    const g = this.add.graphics();
+
+    // ── 나무 패널 배경 ────────────────────────────────────────────
+    g.fillStyle(0x5D3A1A, 1); g.fillRect(0, 0, DW, H);          // 어두운 나무 베이스
+    g.fillStyle(0x8B5E3C, 1); g.fillRect(0, 0, DW, H - 7);      // 메인 나무색
+    g.fillStyle(0xA07850, 1); g.fillRect(0, 0, DW, 7);           // 상단 하이라이트
+    g.fillStyle(0xFFD700, 1); g.fillRect(0, H - 7, DW, 5);       // 금빛 하단 테두리
+    g.fillStyle(0xC8960A, 1); g.fillRect(0, H - 3, DW, 3);       // 어두운 금 마감
+
+    // ── 게임 타이틀 ──────────────────────────────────────────────
+    this.add.text(DW/2, 13, '👑  엘리멘탈 매치  👑', {
+      fontFamily:'"Georgia","Batang",serif', fontSize:'18px',
+      color:'#FFD700', stroke:'#3A1F00', strokeThickness:5,
+    }).setOrigin(0.5);
+
+    // ── 좌측: SCORE 캡슐 ─────────────────────────────────────────
+    const sc = this.add.graphics();
+    sc.fillStyle(0x1A3A6E, 1); sc.fillRoundedRect(12, 36, 204, 82, 12);
+    sc.lineStyle(2.5, 0xFFD700, 1); sc.strokeRoundedRect(12, 36, 204, 82, 12);
+    sc.fillStyle(0x0D2550, 1); sc.fillRoundedRect(14, 38, 200, 30, 9);   // 레이블 배경
+
+    this.add.text(114, 53, 'SCORE', {
+      fontFamily:'monospace', fontSize:'11px', color:'#90BDE8', letterSpacing:3,
+    }).setOrigin(0.5);
+    this.scoreTxt = this.add.text(114, 82, '0', {
+      fontFamily:'"Georgia",serif', fontSize:'26px',
+      color:'#FFFFFF', stroke:'#000000', strokeThickness:2,
+    }).setOrigin(0.5);
+
+    // BEST 라인 (캡슐 하단)
+    const bc = this.add.graphics();
+    bc.fillStyle(0x0A1E3D, 0.9); bc.fillRoundedRect(12, 121, 204, 26, 8);
+    this.add.text(60, 134, 'BEST', {
+      fontFamily:'monospace', fontSize:'9px', color:'#7AAAD0',
+    }).setOrigin(0.5);
+    this.hiScoreTxt = this.add.text(158, 134, this.hiScore.toLocaleString(), {
+      fontFamily:'"Georgia",serif', fontSize:'15px',
+      color:'#FFD700', stroke:'#000000', strokeThickness:2,
+    }).setOrigin(0.5);
+
+    // ── 우측: LIFE 캡슐 ──────────────────────────────────────────
+    const lc = this.add.graphics();
+    lc.fillStyle(0x1A3A6E, 1); lc.fillRoundedRect(324, 36, 204, 82, 12);
+    lc.lineStyle(2.5, 0xFFD700, 1); lc.strokeRoundedRect(324, 36, 204, 82, 12);
+    lc.fillStyle(0x0D2550, 1); lc.fillRoundedRect(326, 38, 200, 30, 9);
+
+    this.add.text(426, 53, 'LIFE', {
+      fontFamily:'monospace', fontSize:'11px', color:'#EF9A9A', letterSpacing:3,
+    }).setOrigin(0.5);
+
+    this.heartGroup = this.add.group();
+    this._buildHearts();
+  }
+
+  _buildHearts() {
+    this.heartGroup.clear(true, true);
+    const spacing = 34;
+    const startX  = 426 - ((MAX_LIVES - 1) * spacing) / 2;
+    for (let i=0; i<MAX_LIVES; i++) {
+      const t = this.add.text(startX + i * spacing, 90,
+        i < this.lives ? '❤️' : '🖤', { fontSize:'30px' }
+      ).setOrigin(0.5);
+      this.heartGroup.add(t);
+    }
+  }
+
+  _buildBoardBg() {
+    const bw = COLS*CELL, bh = ROWS*CELL;
+
+    // ── 보드 외곽 나무 프레임 ─────────────────────────────────────
+    const frame = this.add.graphics();
+    // 어두운 나무 외곽
+    frame.fillStyle(0x5D3A1A, 1); frame.fillRoundedRect(BX-8, BY-8, bw+16, bh+16, 10);
+    // 밝은 나무 내곽
+    frame.fillStyle(0x8B5E3C, 1); frame.fillRoundedRect(BX-5, BY-5, bw+10, bh+10, 8);
+    // 금빛 안쪽 테두리
+    frame.lineStyle(2.5, 0xFFD700, 1); frame.strokeRoundedRect(BX-3, BY-3, bw+6, bh+6, 6);
+
+    // ── 보드 셀 (밝은 파란 체커보드) ─────────────────────────────
+    const cells = this.add.graphics();
+    for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) {
+      // 로얄매치 스타일: 밝은 하늘색 체스판
+      cells.fillStyle((r+c)%2===0 ? 0x5DADE2 : 0x4A9FD4, 1);
+      cells.fillRect(BX+c*CELL, BY+r*CELL, CELL, CELL);
+    }
+
+    // ── 셀 내부 미세 그리드 (밝은 반투명) ────────────────────────
+    const grid = this.add.graphics();
+    grid.lineStyle(1, 0x2980B9, 0.5);
+    for (let c=0; c<=COLS; c++) grid.lineBetween(BX+c*CELL, BY, BX+c*CELL, BY+bh);
+    for (let r=0; r<=ROWS; r++) grid.lineBetween(BX, BY+r*CELL, BX+bw, BY+r*CELL);
+
+    // ── 보드 하단 잔디 띠 ────────────────────────────────────────
+    const grassTop = this.add.graphics();
+    grassTop.fillStyle(0x4CAF50, 1); grassTop.fillRect(BX-5, BY+bh+3, bw+10, 9);
+    grassTop.fillStyle(0x66BB6A, 1); grassTop.fillRect(BX-5, BY+bh+3, bw+10, 4);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  ★ 하단 스킬 패널 빌더
+  //    구성: 패널배경 / 마나바(5종) / 스킬버튼(3개) / 콤보텍스트
+  // ═══════════════════════════════════════════════════════════════
+
+  _buildSkillPanel() {
+    // ── 나무 패널 배경 ────────────────────────────────────────────
+    const panelBg = this.add.graphics();
+    // 잔디 → 나무 패널 전환 구역
+    panelBg.fillStyle(0x388E3C, 1); panelBg.fillRect(0, MANA_Y-14, DW, 14);
+    panelBg.fillStyle(0x5D3A1A, 1); panelBg.fillRect(0, MANA_Y, DW, DH - MANA_Y);
+    panelBg.fillStyle(0x8B5E3C, 1); panelBg.fillRect(0, MANA_Y+5, DW, DH - MANA_Y - 5);
+    // 상단 금빛 구분선
+    panelBg.fillStyle(0xFFD700, 1); panelBg.fillRect(0, MANA_Y, DW, 5);
+    panelBg.fillStyle(0xC8960A, 1); panelBg.fillRect(0, MANA_Y+3, DW, 2);
+
+    // ── MANA 레이블 ───────────────────────────────────────────────
+    this.add.text(DW/2, MANA_Y+18, 'M A N A', {
+      fontFamily:'monospace', fontSize:'10px', color:'#FFD700',
+      stroke:'#3A1F00', strokeThickness:3, letterSpacing:2,
+    }).setOrigin(0.5);
+
+    // ── 5개 마나바 ───────────────────────────────────────────────
+    const itemW = DW / 5;
+    this._manaFills = [];
+    this._manaTxts  = [];
+
+    for (let i=0; i<5; i++) {
+      const cx      = itemW*i + itemW/2;
+      const rowY    = MANA_Y + 36;
+      const barTopY = MANA_Y + 50;
+      const barW    = itemW - 14;
+
+      // 속성 이모지
+      this.add.text(cx - 14, rowY, GEM_DATA[i].symbol, { fontSize:'13px' }).setOrigin(0.5);
+
+      // 수치 텍스트
+      const txt = this.add.text(cx + 17, rowY, '0', {
+        fontFamily:'monospace', fontSize:'11px', color:'#FFE0A0',
+      }).setOrigin(0.5);
+      this._manaTxts.push(txt);
+
+      // 바 배경 (어두운 나무 홈)
+      const barBg = this.add.graphics();
+      barBg.fillStyle(0x3D1F0A, 1);
+      barBg.fillRoundedRect(cx-barW/2, barTopY, barW, 11, 4);
+      // 안쪽 어두운 오목 효과
+      barBg.fillStyle(0x2A1205, 1);
+      barBg.fillRoundedRect(cx-barW/2+1, barTopY+1, barW-2, 9, 3);
+
+      const fill = this.add.graphics();
+      this._manaFills.push({ fill, cx, barTopY, barW });
+    }
+    this._refreshMana();
+
+    // ── 스킬 버튼 3개 (원형, 로얄매치 스타일) ──────────────────
+    this._skillBtnBgs   = [];
+    this._skillCostTxts = [];
+
+    const btnCY   = SKILL_Y + 58;   // 원 중심 Y
+    const btnR    = 46;              // 원 반지름
+    const btnXs   = [DW*0.18, DW*0.50, DW*0.82];  // 3개 버튼 X
+
+    SKILL_DATA.forEach((skill, i) => {
+      const cx = btnXs[i];
+
+      // 원형 버튼 배경 그래픽스
+      const bg = this.add.graphics();
+      // btnX/btnY/btnW/btnH는 _refreshSkillButtons 호환용
+      this._skillBtnBgs.push({ bg, cx, cy: btnCY, r: btnR });
+
+      // 스킬 아이콘 (원 중앙)
+      this.add.text(cx, btnCY - 6, skill.icon, { fontSize:'32px' }).setOrigin(0.5);
+
+      // 스킬 이름 (원 아래)
+      this.add.text(cx, SKILL_Y + 120, skill.name, {
+        fontFamily:'"Georgia",serif', fontSize:'12px', color:'#FFE8C0',
+        stroke:'#3A1F00', strokeThickness:3,
+        align:'center', wordWrap:{ width: 120 },
+      }).setOrigin(0.5, 0);
+
+      // 마나 비용 (이름 아래, 한 줄)
+      const activeCosts = skill.cost
+        .map((c, ti) => ({ typeId:ti, amount:c }))
+        .filter(x => x.amount > 0);
+
+      const costTxts = [];
+      // 비용 텍스트를 한 줄로 이어붙임
+      const costStr = activeCosts.map(({typeId, amount}) => `${GEM_DATA[typeId].symbol}${amount}`).join(' ');
+      const costLine = this.add.text(cx, SKILL_Y + 155, costStr, {
+        fontFamily:'monospace', fontSize:'10px', color:'#FF8080',
+        stroke:'#3A1F00', strokeThickness:2, align:'center',
+      }).setOrigin(0.5, 0);
+
+      // 각 비용 아이템 (색상 업데이트용 개별 참조도 유지)
+      activeCosts.forEach(({ typeId, amount }) => {
+        costTxts.push({ text: costLine, typeId, amount, isShared: true });
+      });
+      this._skillCostTxts.push(costTxts);
+
+      // Zone (탭 감지)
+      const zone = this.add.zone(cx, btnCY, btnR*2, btnR*2 + 80).setInteractive();
+      const sid = i;
+      zone.on('pointerdown', () => this._useSkill(sid));
+    });
+
+    this._refreshSkillButtons();
+
+    // ── 콤보 텍스트 ──────────────────────────────────────────────
+    this.comboTxt = this.add.text(DW/2, BY+ROWS*CELL/2, '', {
+      fontFamily:'"Georgia",serif', fontSize:'32px',
+      color:'#FFD700', stroke:'#3A1F00', strokeThickness:5,
+    }).setOrigin(0.5).setAlpha(0).setDepth(30);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  ★ 마나 관련 메서드
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * 마나 바 채움 그래픽스와 수치 텍스트를 현재 this.mana 기준으로 갱신.
+   * 매치 완료 후와 스킬 사용 후에 호출.
+   */
+  _refreshMana() {
+    for (let i=0; i<5; i++) {
+      const { fill, cx, barTopY, barW } = this._manaFills[i];
+      const pct = Math.min(1, this.mana[i] / MAX_MANA);   // 0~1 비율 (최대 표시 10)
+      fill.clear();
+      if (pct > 0) {
+        fill.fillStyle(GEM_DATA[i].color, 1);
+        fill.fillRoundedRect(cx - barW/2, barTopY, Math.max(6, barW*pct), 10, 3);
+      }
+      this._manaTxts[i].setText(String(this.mana[i]));
+    }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  ★ 스킬 관련 메서드
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * 스킬 버튼 배경색 / 비용 텍스트 색상을 현재 마나 상태로 갱신.
+   * 모든 비용을 충족하면 버튼이 금빛으로 빛남.
+   */
+  _refreshSkillButtons() {
+    SKILL_DATA.forEach((skill, i) => {
+      const { bg, cx, cy, r } = this._skillBtnBgs[i];
+      const canUse = this._canUseSkill(i);
+
+      bg.clear();
+      // 외부 링 (그림자)
+      bg.fillStyle(0x000000, 0.35); bg.fillCircle(cx+2, cy+3, r+4);
+      // 외부 링 (테두리색)
+      bg.fillStyle(canUse ? 0xFFD700 : 0x6B4226, 1); bg.fillCircle(cx, cy, r+4);
+      // 내부 원 베이스
+      bg.fillStyle(canUse ? 0x2E7D32 : 0x4A2510, 1); bg.fillCircle(cx, cy, r);
+      // 내부 하이라이트 (상단 밝음)
+      bg.fillStyle(canUse ? 0x4CAF50 : 0x6B3A18, 1); bg.fillCircle(cx, cy - 6, r - 4);
+      // 사용 가능 시 금빛 광채 링
+      if (canUse) {
+        bg.lineStyle(2, 0xFFE066, 0.7); bg.strokeCircle(cx, cy, r+2);
+      }
+
+      // 비용 텍스트 색상 (공유 텍스트 객체)
+      const costs = this._skillCostTxts[i];
+      if (costs.length > 0 && costs[0].isShared) {
+        const allMet = SKILL_DATA[i].cost.every((c, ti) => this.mana[ti] >= c);
+        costs[0].text.setColor(allMet ? '#88FF99' : '#FF8888');
+      } else {
+        costs.forEach(({ text, typeId, amount }) => {
+          text.setColor(this.mana[typeId] >= amount ? '#88FF99' : '#FF8888');
+        });
+      }
+    });
+  }
+
+  /**
+   * 스킬 id에 대해 현재 마나가 모든 비용을 충족하는지 확인.
+   */
+  _canUseSkill(id) {
+    return SKILL_DATA[id].cost.every((cost, i) => this.mana[i] >= cost);
+  }
+
+  /**
+   * 스킬 사용 진입점.
+   * 상태 체크 → 조건 체크 → 마나 차감 → 스킬 실행.
+   */
+  _useSkill(id) {
+    if (this.state !== S.IDLE || !this._canUseSkill(id)) return;
+
+    // ── 사전 조건 체크 ────────────────────────────────────────────
+    // (점수 쌓기는 조건 없음, 체력·해골 스킬만 체크)
+    if (id === 1 && this.lives >= MAX_LIVES) {
+      this._showSkillNotice('체력이 이미 최대입니다', '#ff8866'); return;
+    }
+    if (id === 2) {
+      const hasSkulls = this.board.flat().some(g => g && GEM_DATA[g.type].isSkull);
+      if (!hasSkulls) { this._showSkillNotice('해골이 없습니다', '#ff8866'); return; }
+    }
+
+    // ── 마나 차감 ─────────────────────────────────────────────────
+    SKILL_DATA[id].cost.forEach((cost, ti) => {
+      this.mana[ti] = Math.max(0, this.mana[ti] - cost);
+    });
+    this._refreshMana();
+    this._refreshSkillButtons();
+
+    // ── 스킬 실행 ─────────────────────────────────────────────────
+    if (id === 0) this._skillScoreBoost();
+    else if (id === 1) this._skillHeal();
+    else if (id === 2) this._skillClearSkulls();
+  }
+
+  /**
+   * 스킬 0: 점수 쌓기
+   * 즉시 점수 +300.
+   */
+  _skillScoreBoost() {
+    this.score += 300;
+    this._refreshScore();
+    this._showSkillNotice('⭐ +300점!', '#FFD700');
+  }
+
+  /**
+   * 스킬 1: 체력 회복
+   * 체력 1 증가 (최대치 초과 불가).
+   */
+  _skillHeal() {
+    this.lives = Math.min(MAX_LIVES, this.lives + 1);
+    this._buildHearts();
+    this._screenFlash(0x00ff88, 0.28, 500);
+    this._showSkillNotice('💊 체력 회복!', '#ff9999');
+  }
+
+  /**
+   * 스킬 2: 해골 파괴
+   * 카운터가 낮은 순서대로 최대 7개의 해골을 파괴.
+   * 피해(생명력 감소)는 없음.
+   */
+  _skillClearSkulls() {
+    // 보드의 모든 해골 수집 후 카운터 오름차순 정렬
+    const allSkulls = [];
+    for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) {
+      const gem = this.board[r][c];
+      if (gem && GEM_DATA[gem.type].isSkull) allSkulls.push({ row:r, col:c, gem });
+    }
+    if (!allSkulls.length) return;
+
+    // 카운터 낮은 순 정렬 후 최대 7개만 선택
+    allSkulls.sort((a, b) => a.gem.skullCounter - b.gem.skullCounter);
+    const targets = allSkulls.slice(0, 7);
+
+    this.state = S.REMOVING;
+    this._showSkillNotice(`⚔️ 해골 파괴! (${targets.length}개)`, '#ff6644');
+
+    let done = 0;
+    targets.forEach(({ row, col, gem }) => {
+      this._skullBurst(gem.container.x, gem.container.y);
+      this.tweens.add({
+        targets:gem.container, scaleX:0, scaleY:0, alpha:0,
+        duration:320, ease:'Back.In',
+        onComplete:() => {
+          this._recycleGem(gem); this.board[row][col] = null;
+          if (++done === targets.length) this._applyGravity();
+        },
+      });
+    });
+  }
+
+  /**
+   * 스킬 발동 알림 팝업.
+   * @param {string} text     표시할 텍스트
+   * @param {string} cssColor CSS 색상 문자열
+   */
+  _showSkillNotice(text, cssColor) {
+    const t = this.add.text(DW/2, BY + ROWS*CELL/2, text, {
+      fontFamily:'"Georgia",serif', fontSize:'24px',
+      color:cssColor, stroke:'#000000', strokeThickness:4,
+    }).setOrigin(0.5).setDepth(70).setAlpha(0);
+    this.tweens.add({ targets:t, alpha:1, y:t.y-15, duration:280, ease:'Back.Out' });
+    this.tweens.add({ targets:t, alpha:0, y:t.y-55, duration:600, delay:480,
+      ease:'Power2.In', onComplete:()=>t.destroy() });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  보드 초기화
+  // ═══════════════════════════════════════════════════════════════
+
+  _initBoard() {
+    for (let r=0; r<ROWS; r++) {
+      this.board[r] = new Array(COLS).fill(null);
+      for (let c=0; c<COLS; c++) {
+        // 초기 배치는 해골 없이 속성 젬(0~4)만 사용 — 유저 경험 보호
+        const type = Phaser.Math.Between(0, NORMAL_GEM_COUNT - 1);
+        this.board[r][c] = this._spawnGem(r, c, type);
+      }
+    }
+  }
+
+  // 10% 확률로 해골, 나머지는 속성 젬 (0~4)
+  _randomType() {
+    // 점수 1000마다 확률 1% 증가, 최대 20% 상한
+    const chance = Math.min(
+      SKULL_CHANCE_MAX,
+      SKULL_CHANCE_BASE + Math.floor(this.score / SKULL_CHANCE_STEP) * 0.01
+    );
+    return Math.random() < chance ? 5 : Phaser.Math.Between(0, NORMAL_GEM_COUNT-1);
+  }
+
+  // 초기 배치에서 3매치 제거 (해골은 제외하여 밸런스 유지)
+  _clearInitialMatches() {
+    let safety=0, matches;
+    do {
+      matches = this._findMatches();
+      matches.forEach(({ row, col }) => {
+        const gem = this.board[row][col];
+        let t;
+        do { t = Phaser.Math.Between(0, NORMAL_GEM_COUNT-1); } while (t === gem.type);
+        gem.type = t;
+        this._styleGem(gem);
+      });
+    } while (matches.length > 0 && ++safety < 300);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  젬 생성 & 오브젝트 풀
+  // ═══════════════════════════════════════════════════════════════
+
+  _spawnGem(row, col, type) {
+    let gem;
+    if (this.pool.length > 0) {
+      gem = this.pool.pop();
+      gem.container.setActive(true).setVisible(true).setAlpha(1).setScale(1);
+      // 풀 재사용 시 카운터 초기화 (이전 상태 잔류 방지)
+      gem.skullCounter = -1;
+    } else {
+      const container   = this.add.container(0, 0);
+      const shadow      = this.add.graphics();
+      const body        = this.add.graphics();
+      const hi          = this.add.graphics();
+      const skullBorder = this.add.graphics();
+      const sym = this.add.text(0, -4, '', { fontSize:'22px' }).setOrigin(0.5);
+      // 해골 카운터 숫자 (우측 하단 배지)
+      const cntBadge = this.add.graphics();
+      const cntTxt = this.add.text(10, 10, '', {
+        fontFamily: 'monospace', fontSize: '13px',
+        color: '#FFFFFF', stroke: '#000000', strokeThickness: 3,
+      }).setOrigin(0.5);
+      shadow.fillStyle(0x000000, 0.55);
+      shadow.fillRoundedRect(-GW/2+3, -GH/2+3, GW, GH, GR);
+      container.add([shadow, body, hi, skullBorder, sym, cntBadge, cntTxt]);
+      gem = { container, shadow, body, hi, skullBorder, sym, cntBadge, cntTxt };
+    }
+    gem.row=row; gem.col=col; gem.type=type; gem.selected=false;
+    // 해골이면 카운터 초기값 SKULL_COUNTER_INIT, 아니면 -1(미사용)
+    if (GEM_DATA[type].isSkull) {
+      gem.skullCounter = SKULL_COUNTER_INIT;
+    } else {
+      gem.skullCounter = -1;
+    }
+    gem.container.setPosition(this._gx(col), this._gy(row));
+    this._styleGem(gem);
+    return gem;
+  }
+
+  _styleGem(gem, sel=false) {
+    const d=GEM_DATA[gem.type], hw=GW/2, hh=GH/2;
+
+    gem.body.clear();
+    // 메인 바디
+    gem.body.fillStyle(d.color, 1);
+    gem.body.fillRoundedRect(-hw, -hh, GW, GH, GR+2);
+    // 선택 테두리 or 일반 테두리
+    gem.body.lineStyle(sel?3.5:2, sel?0xFFFFFF:d.sh, 1);
+    gem.body.strokeRoundedRect(-hw, -hh, GW, GH, GR+2);
+
+    gem.hi.clear();
+    if (!d.isSkull) {
+      // 상단 밝은 하이라이트 (젤리 광택)
+      gem.hi.fillStyle(0xFFFFFF, 0.42);
+      gem.hi.fillRoundedRect(-hw+5, -hh+5, GW-10, GH*0.38, GR-2);
+      // 하단 미세 광택 (입체감)
+      gem.hi.fillStyle(d.hi, 0.18);
+      gem.hi.fillRoundedRect(-hw+8, hh-12, GW-16, 8, 3);
+    } else {
+      // 해골 미세 하이라이트
+      gem.hi.fillStyle(0xFFFFFF, 0.10);
+      gem.hi.fillRoundedRect(-hw+5, -hh+5, GW-10, GH*0.3, GR-2);
+    }
+
+    gem.skullBorder.clear();
+    if (d.isSkull) {
+      gem.skullBorder.lineStyle(2.5, 0xFF3333, 0.9);
+      gem.skullBorder.strokeRoundedRect(-hw-2, -hh-2, GW+4, GH+4, GR+3);
+      gem.skullBorder.lineStyle(1, 0xFF6666, 0.3);
+      gem.skullBorder.lineBetween(-hw+7,-hh+7, hw-7,hh-7);
+      gem.skullBorder.lineBetween(hw-7,-hh+7, -hw+7,hh-7);
+    }
+
+    // 선택 시 외부 빛나는 링
+    if (sel) {
+      gem.skullBorder.lineStyle(2, 0xFFFFAA, 0.6);
+      gem.skullBorder.strokeRoundedRect(-hw-4, -hh-4, GW+8, GH+8, GR+4);
+    }
+
+    gem.sym.setText(d.symbol);
+
+    // 카운터 배지 — 해골 전용 (우측 하단)
+    if (gem.cntBadge) {
+      gem.cntBadge.clear();
+      gem.cntTxt.setText('');
+      if (d.isSkull && gem.skullCounter >= 0) {
+        // 배지 색: 카운터가 낮을수록 붉어짐
+        const badgeColor = gem.skullCounter <= 1 ? 0xFF2222
+                         : gem.skullCounter === 2 ? 0xFF8800
+                         : 0x333333;
+        gem.cntBadge.fillStyle(badgeColor, 1);
+        gem.cntBadge.fillCircle(12, 12, 10);
+        gem.cntBadge.lineStyle(1.5, 0xFFFFFF, 0.8);
+        gem.cntBadge.strokeCircle(12, 12, 10);
+        gem.cntTxt.setText(String(gem.skullCounter));
+      }
+    }
+  }
+
+  _recycleGem(gem) {
+    gem.container.setVisible(false).setActive(false).setAlpha(1).setScale(1);
+    this.pool.push(gem);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  입력 처리
+  // ═══════════════════════════════════════════════════════════════
+
+  _setupInput() {
+    this.input.on('pointerdown', (ptr) => {
+      if (this.state !== S.IDLE) return;
+      this._psx=ptr.x; this._psy=ptr.y;
+      const { r, c } = this._toGrid(ptr.x, ptr.y);
+      if (this._inBoard(r, c)) this._onTap(r, c);
+    });
+    this.input.on('pointerup', (ptr) => {
+      if (this.state !== S.IDLE || !this.selected) return;
+      const dx=ptr.x-this._psx, dy=ptr.y-this._psy;
+      if (Math.hypot(dx, dy) > CELL*0.35) {
+        const { r:sr, c:sc } = this.selected;
+        let tr=sr, tc=sc;
+        if (Math.abs(dx)>=Math.abs(dy)) tc = dx>0?sc+1:sc-1;
+        else tr = dy>0?sr+1:sr-1;
+        if (this._inBoard(tr,tc)) this._trySwap(sr,sc,tr,tc);
+        else this._deselect();
+      }
+    });
+  }
+
+  _onTap(r, c) {
+    if (!this.selected) { this._select(r, c); return; }
+    const { r:sr, c:sc } = this.selected;
+    if (sr===r && sc===c) this._deselect();
+    else if (Math.abs(sr-r)+Math.abs(sc-c)===1) this._trySwap(sr,sc,r,c);
+    else { this._deselect(); this._select(r, c); }
+  }
+
+  _select(r, c) {
+    const gem = this.board[r][c];
+    if (!gem) return;
+    this.selected={r,c}; gem.selected=true;
+    this._styleGem(gem, true);  // 흰 테두리만으로 선택 표시
+  }
+
+  _deselect() {
+    if (!this.selected) return;
+    const gem = this.board[this.selected.r]?.[this.selected.c];
+    if (gem) { gem.selected=false; this.tweens.killTweensOf(gem.container); gem.container.setScale(1).setPosition(this._gx(gem.col),this._gy(gem.row)); this._styleGem(gem,false); }
+    this.selected=null;
+  }
+
+  _deselectVisual() {
+    if (!this.selected) return;
+    const gem = this.board[this.selected.r]?.[this.selected.c];
+    if (gem) { gem.selected=false; this.tweens.killTweensOf(gem.container); gem.container.setScale(1).setPosition(this._gx(gem.col),this._gy(gem.row)); this._styleGem(gem,false); }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  스왑
+  // ═══════════════════════════════════════════════════════════════
+
+  _trySwap(r1,c1,r2,c2) {
+    // ── 플레이어 조작 1회 → 모든 해골 카운터 -1 ─────────────────
+    // 매치 성공 여부와 무관하게 조작 즉시 차감 (원래대로 돌아가는 무효 스왑도 포함)
+    this._tickSkullCounters();
+
+    this.state=S.SWAPPING; this._deselectVisual(); this.selected=null;
+    const g1=this.board[r1][c1], g2=this.board[r2][c2];
+    this.tweens.add({ targets:g1.container, x:this._gx(c2), y:this._gy(r2), duration:220, ease:'Power2.Out' });
+    this.tweens.add({
+      targets:g2.container, x:this._gx(c1), y:this._gy(r1), duration:220, ease:'Power2.Out',
+      onComplete:() => {
+        this._swapData(r1,c1,r2,c2);
+        const matches=this._findMatches();
+        if (matches.length>0) { this.combo=0; this._processMatches(matches); }
+        else {
+          this.tweens.add({ targets:g1.container, x:this._gx(c1), y:this._gy(r1), duration:180, ease:'Power2.In' });
+          this.tweens.add({ targets:g2.container, x:this._gx(c2), y:this._gy(r2), duration:180, ease:'Power2.In',
+            onComplete:()=>{ this._swapData(r2,c2,r1,c1); this.state=S.IDLE; } });
+        }
+      },
+    });
+  }
+
+  _swapData(r1,c1,r2,c2) {
+    [this.board[r1][c1],this.board[r2][c2]]=[this.board[r2][c2],this.board[r1][c1]];
+    const a=this.board[r1][c1], b=this.board[r2][c2];
+    if (a){a.row=r1;a.col=c1;} if (b){b.row=r2;b.col=c2;}
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  매치 탐지
+  // ═══════════════════════════════════════════════════════════════
+
+  _findMatches() {
+    const hit = new Set();
+    // 가로 스캔
+    for (let r=0; r<ROWS; r++) {
+      let c=0;
+      while (c<COLS-2) {
+        const g=this.board[r][c]; if(!g){c++;continue;}
+        let end=c+1;
+        while (end<COLS && this.board[r][end]?.type===g.type) end++;
+        if (end-c>=3) for(let i=c;i<end;i++) hit.add(`${r},${i}`);
+        c=end;
+      }
+    }
+    // 세로 스캔
+    for (let c=0; c<COLS; c++) {
+      let r=0;
+      while (r<ROWS-2) {
+        const g=this.board[r][c]; if(!g){r++;continue;}
+        let end=r+1;
+        while (end<ROWS && this.board[end]?.[c]?.type===g.type) end++;
+        if (end-r>=3) for(let i=r;i<end;i++) hit.add(`${i},${c}`);
+        r=end;
+      }
+    }
+    return [...hit].map(k=>{ const [row,col]=k.split(',').map(Number); return {row,col}; });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  매치 처리 파이프라인
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * 매치된 젬들을 처리한다.
+   * ① ★ 속성 젬 타입별 마나 +1 (매칭된 개수만큼 누적)
+   * ② 점수 계산 (속성 젬만)
+   * ③ 파괴 애니메이션
+   * ※ 해골 피해는 카운터 소진 시 제자리 폭발로 발생 (_explodeReadySkulls)
+   */
+  _processMatches(matches) {
+    this.state=S.REMOVING;
+    this.combo++;
+
+    // ── ★ 마나 획득: 파괴 전에 타입을 읽어 누적 ─────────────────
+    // 속성 젬이 매칭될 때마다 해당 타입 마나 +1
+    // 해골은 마나를 주지 않음
+    matches.forEach(({row,col}) => {
+      const gem = this.board[row][col];
+      if (gem && !GEM_DATA[gem.type].isSkull) {
+        // 마나 최대치(MAX_MANA=10) 초과 누적 불가 — 밸런스 유지
+        this.mana[gem.type] = Math.min(MAX_MANA, this.mana[gem.type] + 1);
+      }
+    });
+    this._refreshMana();
+    this._refreshSkillButtons();
+
+    // ── 점수 계산 ─────────────────────────────────────────────────
+    const normalCount = matches.filter(({row,col})=>!GEM_DATA[this.board[row][col]?.type]?.isSkull).length;
+    const pts = normalCount * BASE_SCORE * this.combo;
+    if (pts>0) { this.score+=pts; this._refreshScore(); }
+    if (this.combo>=2) this._showCombo(this.combo);
+
+    // ── 파괴 애니메이션 + 중력 동시 시작 ───────────────────────
+    // ① 보드 배열을 즉시 null 처리 → _applyGravity가 빈 칸을 바로 인식
+    // ② 파괴 트윈은 순수 시각 연출 (완료 콜백에서 풀 반환만)
+    // ③ 80ms 고정 딜레이 후 중력 시작 → 팝 이펙트가 눈에 들어오는 순간 블록이 내려오기 시작
+    const gemRefs = matches.map(({row,col}) => ({ row, col, gem: this.board[row][col] }));
+
+    // 보드에서 즉시 제거 (중력 계산 기준)
+    gemRefs.forEach(({row,col}) => { this.board[row][col] = null; });
+
+    // 시각 파괴 트윈 (파이프라인과 무관하게 독립 실행)
+    gemRefs.forEach(({gem}) => {
+      if (!gem) return;
+      const isSkull = GEM_DATA[gem.type].isSkull;
+      if (isSkull) this._skullBurst(gem.container.x, gem.container.y);
+      else         this._popScore(gem.container.x, gem.container.y, normalCount>0 ? pts/normalCount : 0);
+      this.tweens.add({
+        targets: gem.container, scaleX:0, scaleY:0, alpha:0,
+        duration: isSkull ? 320 : 240, ease: 'Back.In',
+        onComplete: () => this._recycleGem(gem),   // 풀 반환만, 파이프라인 트리거 없음
+      });
+    });
+
+    // 파괴 연출이 눈에 들어오는 타이밍(80ms)에 중력 즉시 시작
+    if (this.state !== S.GAMEOVER) {
+      this.time.delayedCall(80, () => {
+        if (this.state !== S.GAMEOVER) this._applyGravity();
+      });
+    }
+  }
+
+  _afterRemove() {
+    // 더 이상 사용되지 않음 — _processMatches에서 직접 _applyGravity 호출
+    if (this.state===S.GAMEOVER) return;
+    this._applyGravity();
+  }
+
+  _damageLife(amount) {
+    this.lives=Math.max(0, this.lives-amount);
+    this._buildHearts();
+    this._screenFlash(0xff0000, 0.35, 280);
+    if (this.lives===1) {
+      const last=this.heartGroup.getFirst(true);
+      if (last) this.tweens.add({ targets:last, scaleX:1.6, scaleY:1.6, yoyo:true, repeat:3, duration:100 });
+    }
+    if (this.lives<=0) { this.state=S.GAMEOVER; this.time.delayedCall(500,()=>this._showGameOver()); }
+  }
+
+  _skullBurst(x, y) {
+    for (let i=0; i<8; i++) {
+      const angle=(i/8)*Math.PI*2;
+      const dot=this.add.circle(x,y,5,0xff3333).setDepth(60);
+      this.tweens.add({ targets:dot, x:x+Math.cos(angle)*60, y:y+Math.sin(angle)*60, scaleX:0, scaleY:0, alpha:0, duration:450, ease:'Power2.Out', onComplete:()=>dot.destroy() });
+    }
+    const skull=this.add.text(x,y-10,'💀',{fontSize:'36px'}).setOrigin(0.5).setDepth(61);
+    this.tweens.add({ targets:skull, y:y-60, alpha:0, scale:2, duration:700, ease:'Power2.Out', onComplete:()=>skull.destroy() });
+  }
+
+  _screenFlash(color, alpha, duration) {
+    const flash=this.add.rectangle(DW/2,DH/2,DW,DH,color).setAlpha(alpha).setDepth(100);
+    this.tweens.add({ targets:flash, alpha:0, duration, ease:'Power2.Out', onComplete:()=>flash.destroy() });
+  }
+
+  _showGameOver() {
+    const cx=DW/2, cy=DH/2;
+    const overlay=this.add.rectangle(cx,cy,DW,DH,0x000000).setAlpha(0).setDepth(200);
+    this.tweens.add({ targets:overlay, alpha:0.75, duration:600 });
+
+    // 나무 패널
+    const panelW=380, panelH=340;
+    const panel=this.add.graphics().setDepth(201).setAlpha(0);
+    panel.fillStyle(0x5D3A1A,1); panel.fillRoundedRect(cx-panelW/2-3,cy-panelH/2-3,panelW+6,panelH+6,18);
+    panel.fillStyle(0x8B5E3C,1); panel.fillRoundedRect(cx-panelW/2,cy-panelH/2,panelW,panelH,16);
+    panel.fillStyle(0xA07850,1); panel.fillRoundedRect(cx-panelW/2,cy-panelH/2,panelW,14,{tl:16,tr:16,bl:0,br:0});
+    panel.lineStyle(3,0xFFD700,1); panel.strokeRoundedRect(cx-panelW/2,cy-panelH/2,panelW,panelH,16);
+    this.tweens.add({ targets:panel, alpha:1, duration:400, delay:200 });
+
+    const ico=this.add.text(cx,cy-118,'💀',{fontSize:'68px'}).setOrigin(0.5).setAlpha(0).setDepth(202);
+    this.tweens.add({ targets:ico, alpha:1, y:cy-128, duration:500, delay:350, ease:'Back.Out' });
+
+    const title=this.add.text(cx,cy-48,'GAME  OVER',{
+      fontFamily:'"Georgia",serif', fontSize:'38px', color:'#FF5252',
+      stroke:'#3A1F00', strokeThickness:6,
+    }).setOrigin(0.5).setAlpha(0).setDepth(202);
+    this.tweens.add({ targets:title, alpha:1, duration:400, delay:450 });
+
+    const scoreLbl=this.add.text(cx,cy+10,'최종 점수',{fontFamily:'monospace',fontSize:'12px',color:'#FFE8C0'}).setOrigin(0.5).setAlpha(0).setDepth(202);
+    const scoreVal=this.add.text(cx,cy+46,this.score.toLocaleString(),{
+      fontFamily:'"Georgia",serif',fontSize:'44px',color:'#FFD700',stroke:'#3A1F00',strokeThickness:4,
+    }).setOrigin(0.5).setAlpha(0).setDepth(202);
+
+    const isNewRecord = this.score >= this.hiScore && this.score > 0;
+    const hiLbl=this.add.text(cx,cy+90,
+      isNewRecord ? '🏆  신기록!' : `최고 기록  ${this.hiScore.toLocaleString()}`,
+      { fontFamily:'"Georgia",serif', fontSize: isNewRecord?22:15,
+        color: isNewRecord?'#FFD700':'#C4A882', stroke:'#3A1F00', strokeThickness:3 }
+    ).setOrigin(0.5).setAlpha(0).setDepth(202);
+    this.tweens.add({ targets:[scoreLbl,scoreVal,hiLbl], alpha:1, duration:400, delay:550 });
+
+    // 재시작 버튼 (나무 스타일)
+    const btnY=cy+138;
+    const btnBg=this.add.graphics().setDepth(202).setAlpha(0);
+    btnBg.fillStyle(0x5D3A1A,1); btnBg.fillRoundedRect(cx-120,btnY-28,240,56,14);
+    btnBg.fillStyle(0x8B5E3C,1); btnBg.fillRoundedRect(cx-118,btnY-27,236,52,12);
+    btnBg.fillStyle(0xA07850,1); btnBg.fillRoundedRect(cx-118,btnY-27,236,16,{tl:12,tr:12,bl:0,br:0});
+    btnBg.lineStyle(2.5,0xFFD700,1); btnBg.strokeRoundedRect(cx-120,btnY-28,240,56,14);
+
+    const btnTxt=this.add.text(cx,btnY,'다시 시작  ↺',{
+      fontFamily:'"Georgia",serif',fontSize:'21px',color:'#FFD700',stroke:'#3A1F00',strokeThickness:4,
+    }).setOrigin(0.5).setAlpha(0).setDepth(203);
+    this.tweens.add({ targets:[btnBg,btnTxt], alpha:1, duration:400, delay:680,
+      onComplete:()=>{
+        const zone=this.add.zone(cx,btnY,240,56).setDepth(210).setInteractive();
+        zone.on('pointerover',()=>this.tweens.add({targets:btnTxt,scaleX:1.06,scaleY:1.06,duration:100}));
+        zone.on('pointerout', ()=>this.tweens.add({targets:btnTxt,scaleX:1,scaleY:1,duration:100}));
+        zone.on('pointerdown',()=>this.scene.restart());
+      },
+    });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  중력 & 보충 & 연쇄
+  // ═══════════════════════════════════════════════════════════════
+
+  _applyGravity() {
+    this.state=S.FALLING;
+    let pending=0;
+    for (let c=0; c<COLS; c++) {
+      const colDelay = c * 18;
+      let empty=ROWS-1;
+      for (let r=ROWS-1; r>=0; r--) {
+        const gem=this.board[r][c]; if(!gem) continue;
+        if (r!==empty) {
+          this.board[empty][c]=gem; this.board[r][c]=null;
+          gem.row=empty; gem.col=c;
+          const dist=empty-r;
+          pending++;
+          this.tweens.add({
+            targets:gem.container, y:this._gy(empty),
+            duration: 160 + dist * 55,
+            // 아래쪽 목적지(empty 클수록)일수록 딜레이가 0에 가까워짐
+            // → 바닥부터 먼저 안착하고, 위쪽 블록이 순차적으로 뒤따라 내려옴
+            delay: colDelay + (ROWS - 1 - empty) * 14,
+            ease: 'Cubic.Out',
+            onComplete:()=>{ if(--pending===0) this._refill(); },
+          });
+        }
+        empty--;
+      }
+    }
+    if (pending===0) this._refill();
+  }
+
+  _refill() {
+    if (this.state===S.GAMEOVER) return;
+    this.state=S.REFILLING;
+    const newGems=[];
+
+    for (let c=0; c<COLS; c++) {
+      const colDelay = c * 18;
+
+      // 이 열에서 비어있는 행을 모두 수집 (r 오름차순 = 위→아래 순서)
+      const emptyRows = [];
+      for (let r=0; r<ROWS; r++) {
+        if (this.board[r][c] === null) emptyRows.push(r);
+      }
+      if (!emptyRows.length) continue;
+
+      const total = emptyRows.length;
+      emptyRows.forEach((r, idx) => {
+        // idx=0 → 가장 위쪽 빈 칸, idx=total-1 → 가장 아래쪽 빈 칸
+        // 아래쪽(idx 큰 쪽)이 먼저 도착해야 자연스러운 중력
+        // landOrder=0 → 바닥(가장 먼저 착지), landOrder=total-1 → 꼭대기(가장 늦게 착지)
+        const landOrder = total - 1 - idx;
+
+        const gem = this._spawnGem(r, c, this._randomType());
+        // 보드 위에서 출발 위치: 위쪽 빈 칸일수록 더 높이 시작
+        gem.container.setPosition(this._gx(c), BY - (idx + 1) * CELL).setAlpha(0);
+        this.board[r][c] = gem;
+
+        // 아래쪽 목적지(landOrder=0)는 딜레이 최소 → 바닥부터 채워짐
+        newGems.push({ gem, targetY: this._gy(r), delay: colDelay + landOrder * 60 });
+      });
+    }
+
+    if (!newGems.length) { this._cascade(); return; }
+    let done=0;
+    newGems.forEach(({ gem, targetY, delay }) => {
+      this.tweens.add({
+        targets:gem.container, y:targetY, alpha:1,
+        duration: 340,
+        delay,
+        ease: 'Cubic.Out',
+        onComplete:()=>{ if(++done===newGems.length) this._cascade(); },
+      });
+    });
+  }
+
+  _cascade() {
+    if (this.state===S.GAMEOVER) return;
+    this.time.delayedCall(110, () => {
+      if (this.state===S.GAMEOVER) return;
+      const matches=this._findMatches();
+      if (matches.length>0) this._processMatches(matches);
+      else {
+        this.combo=0;
+        // 모든 콤보 종료 후 카운터 0인 해골 폭발 처리
+        if (this._explodeReadySkulls()) return;
+        this.state=S.IDLE;
+        if(!this._hasMoves()) this.time.delayedCall(500,()=>this._shuffle());
+      }
+    });
+  }
+
+  /**
+   * 모든 해골의 카운터를 1 감소시키고 비주얼을 갱신한다.
+   * _trySwap에서 플레이어 조작 때마다 호출.
+   */
+  _tickSkullCounters() {
+    for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) {
+      const gem = this.board[r][c];
+      if (gem && GEM_DATA[gem.type].isSkull && gem.skullCounter > 0) {
+        gem.skullCounter--;
+        this._styleGem(gem);  // 배지 색·숫자 갱신
+      }
+    }
+  }
+
+  /**
+   * 카운터가 0이 된 해골을 제자리에서 폭발시키고 생명력을 깎는다.
+   * 모든 콤보 완료 후 IDLE 진입 직전에 호출.
+   * @returns {boolean} 처리할 해골이 있었으면 true
+   */
+  _explodeReadySkulls() {
+    const toExplode = [];
+    for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) {
+      const gem = this.board[r][c];
+      if (gem && GEM_DATA[gem.type].isSkull && gem.skullCounter <= 0) {
+        toExplode.push({ r, c, gem });
+      }
+    }
+    if (!toExplode.length) return false;
+
+    this.state = S.REMOVING;
+
+    // 폭발 해골 수만큼 즉시 피해
+    toExplode.forEach(() => this._damageLife(1));
+
+    if (this.state === S.GAMEOVER) {
+      // 게임오버 시 시각 제거만
+      toExplode.forEach(({ r, c, gem }) => {
+        this.board[r][c] = null;
+        this.tweens.add({ targets:gem.container, scaleX:0, scaleY:0, alpha:0,
+          duration:280, ease:'Back.In', onComplete:()=>this._recycleGem(gem) });
+      });
+      return true;
+    }
+
+    // 폭발 이펙트 + 제거
+    let done = 0;
+    toExplode.forEach(({ r, c, gem }) => {
+      this.board[r][c] = null;
+      this._skullBurst(gem.container.x, gem.container.y);
+
+      // 화면 전체 충격 플래시
+      this._screenFlash(0xFF2200, 0.25, 240);
+
+      this.tweens.add({
+        targets:gem.container, scaleX:0, scaleY:0, alpha:0,
+        duration:300, ease:'Back.In',
+        onComplete:() => {
+          this._recycleGem(gem);
+          if (++done === toExplode.length) this._applyGravity();
+        },
+      });
+    });
+
+    return true;
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════
+  //  유틸리티
+  // ═══════════════════════════════════════════════════════════════
+
+  _gx(col) { return BX+col*CELL+CELL/2; }
+  _gy(row) { return BY+row*CELL+CELL/2; }
+  _toGrid(px,py) { return { r:Math.floor((py-BY)/CELL), c:Math.floor((px-BX)/CELL) }; }
+  _inBoard(r,c) { return r>=0&&r<ROWS&&c>=0&&c<COLS; }
+
+  _refreshScore() {
+    this.scoreTxt.setText(this.score.toLocaleString());
+    this.tweens.add({ targets:this.scoreTxt, scaleX:1.5, scaleY:1.5, duration:110, ease:'Back.Out', yoyo:true });
+
+    // 현재 점수가 하이스코어를 넘으면 즉시 갱신 & 저장
+    if (this.score > this.hiScore) {
+      this.hiScore = this.score;
+      localStorage.setItem('elemental_hiscore', String(this.hiScore));
+      this.hiScoreTxt.setText(this.hiScore.toLocaleString());
+      // 신기록 달성 시 금빛 반짝임
+      this.tweens.add({ targets:this.hiScoreTxt, scaleX:1.4, scaleY:1.4, duration:140, ease:'Back.Out', yoyo:true });
+    }
+  }
+
+  _popScore(x, y, pts) {
+    if (!pts||pts<=0) return;
+    const t=this.add.text(x,y,`+${Math.round(pts)}`,{fontFamily:'"Georgia",serif',fontSize:'20px',color:'#FFD700',stroke:'#000000',strokeThickness:3}).setOrigin(0.5).setDepth(50);
+    this.tweens.add({ targets:t, y:y-55, alpha:0, duration:850, ease:'Power2.Out', onComplete:()=>t.destroy() });
+  }
+
+  _showCombo(combo) {
+    const L={2:'🔥 2 콤보!',3:'💥 3 콤보!',4:'⚡ 4 콤보!',5:'🌟 5 콤보!'};
+    this.comboTxt.setText(L[combo]??`✨ ${combo} 콤보!`).setAlpha(1).setScale(0.2);
+    this.tweens.killTweensOf(this.comboTxt);
+    this.tweens.add({ targets:this.comboTxt, scaleX:1, scaleY:1, duration:320, ease:'Back.Out' });
+    this.tweens.add({ targets:this.comboTxt, alpha:0, duration:1100, delay:600 });
+  }
+
+  _hasMoves() {
+    for (let r=0;r<ROWS;r++) for (let c=0;c<COLS;c++) {
+      if (c+1<COLS) { this._swapData(r,c,r,c+1); const ok=this._findMatches().length>0; this._swapData(r,c+1,r,c); if(ok) return true; }
+      if (r+1<ROWS) { this._swapData(r,c,r+1,c); const ok=this._findMatches().length>0; this._swapData(r+1,c,r,c); if(ok) return true; }
+    }
+    return false;
+  }
+
+  _shuffle() {
+    if (this.state===S.GAMEOVER) return;
+    this.comboTxt.setText('🔀 셔플!').setAlpha(1).setScale(0.5);
+    this.tweens.killTweensOf(this.comboTxt);
+    this.tweens.add({ targets:this.comboTxt, scaleX:1, scaleY:1, duration:300, ease:'Back.Out' });
+    this.tweens.add({ targets:this.comboTxt, alpha:0, duration:1200, delay:800 });
+    const gems=[], types=[];
+    for (let r=0;r<ROWS;r++) for (let c=0;c<COLS;c++) { const g=this.board[r][c]; if(g){gems.push(g);types.push(g.type);} }
+    Phaser.Utils.Array.Shuffle(types);
+    gems.forEach((gem,i)=>{
+      this.tweens.add({ targets:gem.container, alpha:0, duration:200, delay:i*4, yoyo:true,
+        onYoyo:()=>{ gem.type=types[i]; this._styleGem(gem); } });
+    });
+    this.time.delayedCall(gems.length*4+450,()=>{ this._clearInitialMatches(); this.state=S.IDLE; });
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Phaser 게임 인스턴스
+// ═══════════════════════════════════════════════════════════════════
+const config = {
+  type: Phaser.AUTO,
+  scale: { mode:Phaser.Scale.FIT, autoCenter:Phaser.Scale.CENTER_BOTH, width:DW, height:DH, parent:document.body },
+  physics: { default:'arcade', arcade:{ gravity:{y:0}, debug:false } },
+  backgroundColor: '#5BAADC',
+  scene: [GameScene],
+};
+const game = new Phaser.Game(config);
+</script>
+</body>
+</html>
